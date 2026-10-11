@@ -8,6 +8,9 @@
                  1=打断：立即停止当前，从当前规划位置执行新指令
                  2=缓存：当前完成后自动执行缓存的指令（缓存槽满则拒绝）
               4. 所有输出由本FB统一维护
+              5. 空闲（无指令执行）时输出跟随当前输入角度：
+                 TarTheta = CurTheta（1:1），Plan = FK(CurTheta)，PlanV = 0
+                 执行指令时：TarTheta = IK(Plan)+前馈，Plan = 运动规划输出
    ============================================================================ *)
 
 FUNCTION_BLOCK FB_DeltaCore
@@ -193,18 +196,24 @@ fbCIR(
 
 (* ============================================================================
    选择当前运动FB的规划位置和速度
+   空闲时输出跟随当前输入角度（Plan = FK 位置，速度 = 0）
    ============================================================================ *)
-CASE curType OF
-    0:
-        PlanX := fbPTP.PlanX; PlanY := fbPTP.PlanY; PlanZ := fbPTP.PlanZ;
-        planVX := fbPTP.PlanVX; planVY := fbPTP.PlanVY; planVZ := fbPTP.PlanVZ;
-    1:
-        PlanX := fbLIN.PlanX; PlanY := fbLIN.PlanY; PlanZ := fbLIN.PlanZ;
-        planVX := fbLIN.PlanVX; planVY := fbLIN.PlanVY; planVZ := fbLIN.PlanVZ;
-    2:
-        PlanX := fbCIR.PlanX; PlanY := fbCIR.PlanY; PlanZ := fbCIR.PlanZ;
-        planVX := fbCIR.PlanVX; planVY := fbCIR.PlanVY; planVZ := fbCIR.PlanVZ;
-END_CASE;
+IF Busy THEN
+    CASE curType OF
+        0:
+            PlanX := fbPTP.PlanX; PlanY := fbPTP.PlanY; PlanZ := fbPTP.PlanZ;
+            planVX := fbPTP.PlanVX; planVY := fbPTP.PlanVY; planVZ := fbPTP.PlanVZ;
+        1:
+            PlanX := fbLIN.PlanX; PlanY := fbLIN.PlanY; PlanZ := fbLIN.PlanZ;
+            planVX := fbLIN.PlanVX; planVY := fbLIN.PlanVY; planVZ := fbLIN.PlanVZ;
+        2:
+            PlanX := fbCIR.PlanX; PlanY := fbCIR.PlanY; PlanZ := fbCIR.PlanZ;
+            planVX := fbCIR.PlanVX; planVY := fbCIR.PlanVY; planVZ := fbCIR.PlanVZ;
+    END_CASE;
+ELSE
+    PlanX := CurX; PlanY := CurY; PlanZ := CurZ;
+    planVX := 0.0; planVY := 0.0; planVZ := 0.0;
+END_IF;
 
 
 (* ============================================================================
@@ -219,9 +228,17 @@ fbKin(
     CycleTime:=CycleTime, Enable:=Enable
 );
 
-TarTheta1 := fbKin.TarTheta1;
-TarTheta2 := fbKin.TarTheta2;
-TarTheta3 := fbKin.TarTheta3;
+IF Busy THEN
+    (* 执行指令：输出指令计算的目标角度 *)
+    TarTheta1 := fbKin.TarTheta1;
+    TarTheta2 := fbKin.TarTheta2;
+    TarTheta3 := fbKin.TarTheta3;
+ELSE
+    (* 空闲：目标角度 = 当前输入角度（跟随实际位置） *)
+    TarTheta1 := CurTheta1;
+    TarTheta2 := CurTheta2;
+    TarTheta3 := CurTheta3;
+END_IF;
 CurX := fbKin.CurX;
 CurY := fbKin.CurY;
 CurZ := fbKin.CurZ;

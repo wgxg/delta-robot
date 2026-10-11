@@ -361,7 +361,6 @@ class FB_LIN:
         self.sAcc = 0.0
         self.exLast = False
         self.enLast = False
-        self.initialized = False
         self.startX = self.startY = self.startZ = 0.0
         self.tgtX = self.tgtY = self.tgtZ = 0.0
         self.dirX = self.dirY = self.dirZ = 0.0
@@ -374,7 +373,6 @@ class FB_LIN:
             self.PlanX = self.PlanY = self.PlanZ = 0.0
             self.PlanVX = self.PlanVY = self.PlanVZ = 0.0
             self.InPos = False; self.Busy = False; self.phase = 0; self.s = 0.0
-            self.initialized = False
             return
 
         if not self.enLast:
@@ -385,11 +383,8 @@ class FB_LIN:
         self.exLast = Execute
 
         if exRise:
-            if not self.initialized:
-                self.startX = InitX; self.startY = InitY; self.startZ = InitZ
-                self.initialized = True
-            else:
-                self.startX = self.PlanX; self.startY = self.PlanY; self.startZ = self.PlanZ
+            # 始终以 Init（核心层提供的FK实际位置）为起点，保证与实际位置连续
+            self.startX = InitX; self.startY = InitY; self.startZ = InitZ
             dx = TargetX - self.startX
             dy = TargetY - self.startY
             dz = TargetZ - self.startZ
@@ -476,7 +471,6 @@ class FB_CIR:
         self.sAcc = 0.0
         self.exLast = False
         self.enLast = False
-        self.initialized = False
         # 几何
         self.cx = self.cy = self.cz = 0.0
         self.radius = 0.0
@@ -496,7 +490,6 @@ class FB_CIR:
             self.PlanX = self.PlanY = self.PlanZ = 0.0
             self.PlanVX = self.PlanVY = self.PlanVZ = 0.0
             self.InPos = False; self.Busy = False; self.phase = 0; self.s = 0.0
-            self.initialized = False
             return
 
         if not self.enLast:
@@ -507,11 +500,8 @@ class FB_CIR:
         self.exLast = Execute
 
         if exRise:
-            if not self.initialized:
-                sx, sy, sz = InitX, InitY, InitZ
-                self.initialized = True
-            else:
-                sx, sy, sz = self.PlanX, self.PlanY, self.PlanZ
+            # 始终以 Init（核心层提供的FK实际位置）为起点，保证与实际位置连续
+            sx, sy, sz = InitX, InitY, InitZ
             ex, ey, ez = TargetX, TargetY, TargetZ
             self.ex, self.ey, self.ez = ex, ey, ez
 
@@ -764,23 +754,36 @@ class FB_DeltaCore:
                    effCmd.Accel, effCmd.Jerk, effCmd.MoveMode, CycleTime,
                    Enable, execCIR, self.CurX, self.CurY, self.CurZ)
 
-        if self.curType == 0:
-            self.PlanX = self.fbPTP.PlanX; self.PlanY = self.fbPTP.PlanY; self.PlanZ = self.fbPTP.PlanZ
-            planVX = self.fbPTP.PlanVX; planVY = self.fbPTP.PlanVY; planVZ = self.fbPTP.PlanVZ
-        elif self.curType == 1:
-            self.PlanX = self.fbLIN.PlanX; self.PlanY = self.fbLIN.PlanY; self.PlanZ = self.fbLIN.PlanZ
-            planVX = self.fbLIN.PlanVX; planVY = self.fbLIN.PlanVY; planVZ = self.fbLIN.PlanVZ
+        # 规划位置/速度选择：执行时用运动FB输出，空闲时跟随当前输入角度
+        if self.Busy:
+            if self.curType == 0:
+                self.PlanX = self.fbPTP.PlanX; self.PlanY = self.fbPTP.PlanY; self.PlanZ = self.fbPTP.PlanZ
+                planVX = self.fbPTP.PlanVX; planVY = self.fbPTP.PlanVY; planVZ = self.fbPTP.PlanVZ
+            elif self.curType == 1:
+                self.PlanX = self.fbLIN.PlanX; self.PlanY = self.fbLIN.PlanY; self.PlanZ = self.fbLIN.PlanZ
+                planVX = self.fbLIN.PlanVX; planVY = self.fbLIN.PlanVY; planVZ = self.fbLIN.PlanVZ
+            else:
+                self.PlanX = self.fbCIR.PlanX; self.PlanY = self.fbCIR.PlanY; self.PlanZ = self.fbCIR.PlanZ
+                planVX = self.fbCIR.PlanVX; planVY = self.fbCIR.PlanVY; planVZ = self.fbCIR.PlanVZ
         else:
-            self.PlanX = self.fbCIR.PlanX; self.PlanY = self.fbCIR.PlanY; self.PlanZ = self.fbCIR.PlanZ
-            planVX = self.fbCIR.PlanVX; planVY = self.fbCIR.PlanVY; planVZ = self.fbCIR.PlanVZ
+            # 空闲：Plan = FK(当前角度)，速度 = 0
+            self.PlanX = self.CurX; self.PlanY = self.CurY; self.PlanZ = self.CurZ
+            planVX = planVY = planVZ = 0.0
 
         self.fbKin(R, r, L, l, self.PlanX, self.PlanY, self.PlanZ,
                    planVX, planVY, planVZ, FfEnable, Kff,
                    CurTheta1, CurTheta2, CurTheta3, CycleTime, Enable)
 
-        self.TarTheta1 = self.fbKin.TarTheta1
-        self.TarTheta2 = self.fbKin.TarTheta2
-        self.TarTheta3 = self.fbKin.TarTheta3
+        if self.Busy:
+            # 执行指令：输出指令计算的目标角度
+            self.TarTheta1 = self.fbKin.TarTheta1
+            self.TarTheta2 = self.fbKin.TarTheta2
+            self.TarTheta3 = self.fbKin.TarTheta3
+        else:
+            # 空闲：目标角度 = 当前输入角度（跟随实际位置）
+            self.TarTheta1 = CurTheta1
+            self.TarTheta2 = CurTheta2
+            self.TarTheta3 = CurTheta3
         self.CurX = self.fbKin.CurX
         self.CurY = self.fbKin.CurY
         self.CurZ = self.fbKin.CurZ
@@ -892,10 +895,11 @@ if __name__ == '__main__':
     # 先PTP到起点
     cmd0 = make_cmd(0, 0, 0, 300, speed=200, accel=1000)
     run_core(core, cmd0)
-    cmd = make_cmd(1, 100, 50, 350, speed=200, accel=1000, move_mode=0)
+    # 目标须在工作空间内：(100,50,350) 超出可达范围（该XY半径下Z_max≈345）
+    cmd = make_cmd(1, 60, 30, 320, speed=200, accel=1000, move_mode=0)
     cycles, _, _, _ = run_core(core, cmd)
     test("运动完成", cycles > 0)
-    test("到达目标", abs(core.PlanX-100)<1 and abs(core.PlanY-50)<1 and abs(core.PlanZ-350)<1,
+    test("到达目标", abs(core.PlanX-60)<1 and abs(core.PlanY-30)<1 and abs(core.PlanZ-320)<1,
          f"({core.PlanX:.1f},{core.PlanY:.1f},{core.PlanZ:.1f})")
 
     print("\n" + "=" * 60)

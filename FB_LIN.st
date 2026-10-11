@@ -49,7 +49,6 @@ VAR
     exLast:BOOL;
     exRise:BOOL;
     enLast:BOOL;
-    initialized:BOOL;
 END_VAR
 
 
@@ -57,7 +56,6 @@ IF NOT Enable THEN
     PlanX:=0.0; PlanY:=0.0; PlanZ:=0.0;
     PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
     InPos:=FALSE; Busy:=FALSE; phase:=0; s:=0.0;
-    initialized:=FALSE;
     RETURN;
 END_IF;
 
@@ -76,13 +74,8 @@ exLast := Execute;
    启动：记录起点，计算方向和总距离
    ============================================================================ *)
 IF exRise THEN
-    (* 首次运动用 Init（实际位置）作起点，后续用上一次规划终点 *)
-    IF NOT initialized THEN
-        startX := InitX; startY := InitY; startZ := InitZ;
-        initialized := TRUE;
-    ELSE
-        startX := PlanX; startY := PlanY; startZ := PlanZ;
-    END_IF;
+    (* 始终以 Init（核心层提供的FK实际位置）为起点，保证与实际位置连续 *)
+    startX := InitX; startY := InitY; startZ := InitZ;
     dirX := TargetX - startX;
     dirY := TargetY - startY;
     dirZ := TargetZ - startZ;

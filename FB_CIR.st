@@ -80,7 +80,6 @@ VAR
     exLast:BOOL;
     exRise:BOOL;
     enLast:BOOL;
-    initialized:BOOL;
 END_VAR
 
 
@@ -88,7 +87,6 @@ IF NOT Enable THEN
     PlanX:=0.0; PlanY:=0.0; PlanZ:=0.0;
     PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
     InPos:=FALSE; Busy:=FALSE; phase:=0; s:=0.0;
-    initialized:=FALSE;
     RETURN;
 END_IF;
 
@@ -105,13 +103,8 @@ exLast := Execute;
    启动：求圆心、半径、平面基向量、夹角
    ============================================================================ *)
 IF exRise THEN
-    (* 首次运动用 Init（实际位置）作起点，后续用上一次规划终点 *)
-    IF NOT initialized THEN
-        sx := InitX; sy := InitY; sz := InitZ;
-        initialized := TRUE;
-    ELSE
-        sx := PlanX; sy := PlanY; sz := PlanZ;
-    END_IF;
+    (* 始终以 Init（核心层提供的FK实际位置）为起点，保证与实际位置连续 *)
+    sx := InitX; sy := InitY; sz := InitZ;
     ex := TargetX; ey := TargetY; ez := TargetZ;
 
     IF CirMode = 0 THEN
