@@ -2,7 +2,7 @@
 
 > 构型选型：**方案① 三主臂＋三副臂**（Fanuc M-3iA/6A 同类六轴 Delta）
 > 前置版本：`../delta-3dof/`（PLCopen 架构重构完成，39+14+269 项测试全绿，commit 04119a0）
-> 状态：P0 运动学原型完成（test_kin6 25 项断言全绿）；**P1 调度复用验证完成**（test_delta6 53 项 + test_matrix6 269 项全绿，断言数与 3DOF 版一致），进入 P2
+> 状态：P0 运动学原型完成（test_kin6 25 项断言全绿）；P1 调度复用验证完成（test_delta6 53 项 + test_matrix6 269 项全绿，断言数与 3DOF 版一致）；**P2 ST 移植完成**（6 个 .st + st_runtime.py + test_st6.py，13 场景逐拍对拍全绿，M3 达成）
 
 ---
 
@@ -133,6 +133,10 @@ g_j(x) = |Ej(φj) − (p + Rot·dj)|² − lb²  （j = 1..3）
 - **P1 关键发现——多装配解与 FK 初值策略（重要）**：六链 FK 与 3DOF 一样存在多组装配解，P0 的"100% 收敛"只验证残差收敛、不验证装配正确。P1 实测：
   - 纯牛顿温启动（初值=上拍 Cur）在带姿态的连续路径上会滑入另一装配根（LIN 段 60/510 周期姿态偏差 22°）；增加 **Levenberg-Marquardt 阻尼 + 残差严格单调线搜索**（`fk_track`，λ 自适应）后，因异根间隔 20°+ 且中间为高残差壁垒，无法跨越——但当路径**穿过 FK 折叠奇异（两装配根合并点，即 vol 退化区）**时，连续性跟踪会沿另一页平滑滑走（实测 i=146 起 0.1mm/拍单调发散，IK 全程成功无选支翻转）。
   - **最终策略：Busy 时以【规划位姿 Plan】为 FK 初值**（电机实际位姿必在 Plan 的伺服滞后邻域内，Plan 所在装配页即唯一正确页），LM 求解；冷启动用 DEFAULT_GUESS 纯牛顿。实测穿越折叠段最大 Cur−Plan 偏差 0.4 mm / 0.1°（纯伺服滞后），终点精确。**ST 移植时 FK 初值必须取 Plan，不可只取上拍 Cur。**
+- **P2 ST 移植数值对齐要点（逐拍对拍实测）**：
+  - 全量 **LREAL 双精度**；对外 Plan/Cur 的 A/B/C 用度，运动学边界 RAD()/DEG() 转弧度；方位常量 `cos/sin(2π/3)、cos/sin(4π/3)` 必须运行时计算（本机实测 cos2π/3 = −0.4999999999999998、cos4π/3 = −0.5000000000000004，硬编码 −0.5 即引入 1ULP 差）。
+  - **求和对齐（关键坑）**：CPython 内建 `sum()` 对 float 并非朴素左结合（带部分和补偿），而 ST 累加器是朴素左结合。`fk_track` 的 4 处内建 sum 归约（JᵀJ 内积、Jᵀf、err0=Σfv²、e1=Σf1²）在纯平移 LIN 的近奇异姿态列（列范数 0.095 vs 位置列 23646，条件数 ~2.5e5）上差 1ULP，被病态放大为 FK 姿态输出逐拍发散（行程内 2.5e-11 → 1e-4 rad 且反号）。ST 侧这 4 处改用 **Neumaier 补偿求和**（17640 真实样本与 CPython sum / math.fsum 100% 逐位一致；Kahan 反而有 749 例不一致，不可用）。注意 Python 的列范数 cn 与 Mode2 `fk()` 全部归约本来就是朴素 `s += v*v` 循环，ST 对应点保持朴素，不可改。
+  - 对拍以真实 .st 文件经 ST 子集解释器（st_runtime.py）加载执行，非重写仿真；13 场景（PTP/LIN/CIR/打断/缓存/拒绝脉冲/失能恢复/前馈/槽满清空/大行程/连段）逐拍 Tar/Plan/Cur 角差 < 1e-3、BOOL/INT 严格相等。
 - **降级策略**：FK 仅服务 Cur 位姿显示/监控，若 ST 实时性吃紧可降为每 N 拍更新一次；IK/规划路径不依赖 FK。
 
 ### 3.4 奇异性与失效
@@ -235,7 +239,7 @@ END_TYPE
 |---|---|---|
 | **P0 运动学原型 ✅** | `kinematics6.py`：IK/FK/前馈；往返对拍、工作空间扫描、奇异扫描、牛顿收敛统计 | `test_kin6.py` 25 项断言全绿（含 --full：温启动 10 万 + 冷启动 1 万）；往返误差 < 1e-6 mm / 1e-6 rad，收敛率 100% |
 | **P1 调度复用验证 ✅** | 移植 World/Sim 到 6 电机；test_delta6（基础+信号语义）、test_matrix6（打断/缓存/模糊） | **test_delta6.py 53 项 + test_matrix6.py 269 项全绿（269 与 3DOF 矩阵断言数逐一对齐）；模糊 20 序列：无死锁、owner 一致、Tar 单步 <0.05 rad、FK(Tar)≈Plan <0.5mm/0.01rad、终态闭环；过程中修复 CIR 弧长归一化 bug（_build_geom 返回布尔被当弧长，速度放大~30×）与缓存提升起点陈旧问题；新增 `fk_track`（LM+单调线搜索）并确立 Plan 锚定 FK 初值策略** |
-| **P2 ST 移植** | `DeltaTypes6.st` + 5 个 FB；与 Python 版逐行对拍 | ST 编译通过 + 对拍阈值 1e-3 |
+| **P2 ST 移植 ✅** | `DeltaTypes6.st` + 5 个 FB（Core/Kinematics/PTP/LIN/CIR，Kinematics 内含 Solve6）；`st_runtime.py` ST 子集解释器加载真实 .st，`test_st6.py` 与 Python 双环境逐拍对拍 | **test_st6.py 13 场景全绿（Tar/Plan/Cur \|Δ\|<1e-3，BOOL/INT 严格相等）；Python 回归 53+25+269 项不破坏；过程中修复 CPython sum vs ST 朴素累加的 1ULP 分叉（fk_track 4 处归约改 Neumaier 补偿求和，见 3.3）** |
 | **P3 集成回归** | 三套 6DOF 测试 + 3DOF 回归不破坏 | 全绿后提交 |
 
 ### 5.2 精度/性能指标（初版）
@@ -262,8 +266,10 @@ delta-robot/
     ├── test_kin6.py       # P0：运动学测试
     ├── test_delta6.py     # P1：基础+信号语义
     ├── test_matrix6.py    # P1：矩阵+模糊（复用 3DOF 框架）
+    ├── st_runtime.py      # P2：ST 子集解释器（加载真实 .st 执行）
+    ├── test_st6.py        # P2：ST/Python 双环境 13 场景逐拍对拍
     └── DeltaTypes6.st / FB_DeltaCore6.st / FB_DeltaKinematics6.st /
-        FB_PTP6.st / FB_LIN6.st / FB_CIR6.st   # P2
+        FB_PTP6.st / FB_LIN6.st / FB_CIR6.st   # P2 ✅
 ```
 
 ---
@@ -288,5 +294,5 @@ delta-robot/
 
 - **M1（P0 完成）✅**：test_kin6 25 项断言全绿（含 --full：温启动 10 万 + 冷启动 1 万），往返精度 < 1e-6、收敛率 100% 达标。
 - **M2（P1 完成）✅**：test_delta6 53 项 + test_matrix6 269 项全绿（矩阵断言数与 3DOF 逐一对齐，打断/缓存/重触发/信号/失能/随机模糊语义一致）；fk_track 与 Plan 锚定策略已纳入 Python 黄金参考，作为 P2 ST 对拍基准。
-- **M3（P2 完成）**：ST 代码与 Python 对拍通过（相同指令序列逐拍 Tar 角差 < 1e-3）。
+- **M3（P2 完成）✅**：6 个 .st（DeltaTypes6/FB_DeltaCore6/FB_DeltaKinematics6 含 FB_Solve6/FB_PTP6/FB_LIN6/FB_CIR6）经 st_runtime.py 加载真实文件执行，test_st6.py 13 场景与 Python 黄金参考逐拍对拍全绿（Tar/Plan/Cur |Δ| < 1e-3，BOOL/INT 严格相等）；fk_track 四处归约用 Neumaier 补偿求和与 CPython sum 逐位对齐（见 3.3）。
 - **M4（交付）**：全量回归绿 + 提交推送 GitHub。
