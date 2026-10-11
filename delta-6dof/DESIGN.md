@@ -2,7 +2,7 @@
 
 > 构型选型：**方案① 三主臂＋三副臂**（Fanuc M-3iA/6A 同类六轴 Delta）
 > 前置版本：`../delta-3dof/`（PLCopen 架构重构完成，39+14+269 项测试全绿，commit 04119a0）
-> 状态：P0 运动学原型完成（test_kin6 25 项断言全绿）；P1 调度复用验证完成（test_delta6 53 项 + test_matrix6 269 项全绿，断言数与 3DOF 版一致）；**P2 ST 移植完成**（6 个 .st + st_runtime.py + test_st6.py，13 场景逐拍对拍全绿，M3 达成）
+> 状态：P0~P3 全部完成。P2 ST 移植（6 个 .st + st_runtime.py + test_st6.py，13 场景逐拍对拍全绿）；**P3 集成回归完成（6DOF 360 项 + 3DOF 322 项 = 682 项全绿，M4 达成）**
 
 ---
 
@@ -240,7 +240,7 @@ END_TYPE
 | **P0 运动学原型 ✅** | `kinematics6.py`：IK/FK/前馈；往返对拍、工作空间扫描、奇异扫描、牛顿收敛统计 | `test_kin6.py` 25 项断言全绿（含 --full：温启动 10 万 + 冷启动 1 万）；往返误差 < 1e-6 mm / 1e-6 rad，收敛率 100% |
 | **P1 调度复用验证 ✅** | 移植 World/Sim 到 6 电机；test_delta6（基础+信号语义）、test_matrix6（打断/缓存/模糊） | **test_delta6.py 53 项 + test_matrix6.py 269 项全绿（269 与 3DOF 矩阵断言数逐一对齐）；模糊 20 序列：无死锁、owner 一致、Tar 单步 <0.05 rad、FK(Tar)≈Plan <0.5mm/0.01rad、终态闭环；过程中修复 CIR 弧长归一化 bug（_build_geom 返回布尔被当弧长，速度放大~30×）与缓存提升起点陈旧问题；新增 `fk_track`（LM+单调线搜索）并确立 Plan 锚定 FK 初值策略** |
 | **P2 ST 移植 ✅** | `DeltaTypes6.st` + 5 个 FB（Core/Kinematics/PTP/LIN/CIR，Kinematics 内含 Solve6）；`st_runtime.py` ST 子集解释器加载真实 .st，`test_st6.py` 与 Python 双环境逐拍对拍 | **test_st6.py 13 场景全绿（Tar/Plan/Cur \|Δ\|<1e-3，BOOL/INT 严格相等）；Python 回归 53+25+269 项不破坏；过程中修复 CPython sum vs ST 朴素累加的 1ULP 分叉（fk_track 4 处归约改 Neumaier 补偿求和，见 3.3）** |
-| **P3 集成回归** | 三套 6DOF 测试 + 3DOF 回归不破坏 | 全绿后提交 |
+| **P3 集成回归 ✅** | 三套 6DOF 测试 + 3DOF 回归不破坏 | **6DOF 360 项（kin6 25 + delta6 53 + matrix6 269 + st6 13）+ 3DOF 322 项（delta 39 + verify2 14 + matrix 269）= 682 项全绿，3DOF 侧零改动零破坏** |
 
 ### 5.2 精度/性能指标（初版）
 
@@ -295,4 +295,4 @@ delta-robot/
 - **M1（P0 完成）✅**：test_kin6 25 项断言全绿（含 --full：温启动 10 万 + 冷启动 1 万），往返精度 < 1e-6、收敛率 100% 达标。
 - **M2（P1 完成）✅**：test_delta6 53 项 + test_matrix6 269 项全绿（矩阵断言数与 3DOF 逐一对齐，打断/缓存/重触发/信号/失能/随机模糊语义一致）；fk_track 与 Plan 锚定策略已纳入 Python 黄金参考，作为 P2 ST 对拍基准。
 - **M3（P2 完成）✅**：6 个 .st（DeltaTypes6/FB_DeltaCore6/FB_DeltaKinematics6 含 FB_Solve6/FB_PTP6/FB_LIN6/FB_CIR6）经 st_runtime.py 加载真实文件执行，test_st6.py 13 场景与 Python 黄金参考逐拍对拍全绿（Tar/Plan/Cur |Δ| < 1e-3，BOOL/INT 严格相等）；fk_track 四处归约用 Neumaier 补偿求和与 CPython sum 逐位对齐（见 3.3）。
-- **M4（交付）**：全量回归绿 + 提交推送 GitHub。
+- **M4（交付）✅**：全量回归绿（6DOF 360 + 3DOF 322 = 682 项）+ 提交推送 GitHub。
