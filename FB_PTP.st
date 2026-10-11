@@ -172,6 +172,7 @@ IF exRise THEN
     IF totalDist < 1.0E-4 THEN
         (* 已在目标位置 *)
         PlanX:=tgtX; PlanY:=tgtY; PlanZ:=tgtZ;
+        PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
         s:=1.0; phase:=4; InPos:=TRUE; Busy:=FALSE;
     ELSE
         maxSVel:=Speed/totalDist;
@@ -272,7 +273,8 @@ IF phase <> 4 AND phase <> 0 THEN
     PlanVZ := (tgtZ - curZ) * sVel;
 
     IF phase = 4 THEN
-        PlanX := tgtX; PlanY := tgtY; PlanZ := tgtZ;
+        (* Plan 保持为最终插值角度的 FK 结果（≈目标，误差为FK数值精度），
+           不强制写为目标值：目标不可达时避免虚报位置 *)
         PlanVX := 0.0; PlanVY := 0.0; PlanVZ := 0.0;
         InPos := TRUE; Busy := FALSE;
     END_IF;

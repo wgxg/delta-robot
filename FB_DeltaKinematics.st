@@ -86,6 +86,7 @@ VAR
     Bix, Biy, Biz : REAL;
     dTh1_ff, dTh2_ff, dTh3_ff : REAL;
     ikTh1, ikTh2, ikTh3 : REAL;
+    ok1, ok2, ok3 : BOOL;   (* 各轴 IK 求解成功标志（用于门控该轴前馈） *)
     ct, st        : REAL;
 END_VAR
 
@@ -165,11 +166,11 @@ C := L*L + (e-xp)*(e-xp) + yp*yp + PlanZ*PlanZ - l*l;
 Disc := A*A + B*B - C*C;
 
 IF Disc < 0.0 THEN
-    IK_OK := FALSE; ikTh1 := TarTheta1;
+    ok1 := FALSE; ikTh1 := TarTheta1;
 ELSE
     denom := C - A;
     IF ABS(denom) < 1.0E-9 THEN
-        IK_OK := FALSE; ikTh1 := TarTheta1;
+        ok1 := FALSE; ikTh1 := TarTheta1;
     ELSE
         u1 := (-B + SQRT(Disc)) / denom;
         u2 := (-B - SQRT(Disc)) / denom;
@@ -183,7 +184,7 @@ ELSE
         ELSIF thetaSol2 > 0.0 THEN ikTh1 := thetaSol2;
         ELSE ikTh1 := thetaSol1;
         END_IF;
-        IK_OK := TRUE;
+        ok1 := TRUE;
     END_IF;
 END_IF;
 
@@ -196,11 +197,11 @@ C := L*L + (e-xp)*(e-xp) + yp*yp + PlanZ*PlanZ - l*l;
 Disc := A*A + B*B - C*C;
 
 IF Disc < 0.0 THEN
-    IK_OK := FALSE; ikTh2 := TarTheta2;
+    ok2 := FALSE; ikTh2 := TarTheta2;
 ELSE
     denom := C - A;
     IF ABS(denom) < 1.0E-9 THEN
-        IK_OK := FALSE; ikTh2 := TarTheta2;
+        ok2 := FALSE; ikTh2 := TarTheta2;
     ELSE
         u1 := (-B + SQRT(Disc)) / denom;
         u2 := (-B - SQRT(Disc)) / denom;
@@ -214,6 +215,7 @@ ELSE
         ELSIF thetaSol2 > 0.0 THEN ikTh2 := thetaSol2;
         ELSE ikTh2 := thetaSol1;
         END_IF;
+        ok2 := TRUE;
     END_IF;
 END_IF;
 
@@ -226,11 +228,11 @@ C := L*L + (e-xp)*(e-xp) + yp*yp + PlanZ*PlanZ - l*l;
 Disc := A*A + B*B - C*C;
 
 IF Disc < 0.0 THEN
-    IK_OK := FALSE; ikTh3 := TarTheta3;
+    ok3 := FALSE; ikTh3 := TarTheta3;
 ELSE
     denom := C - A;
     IF ABS(denom) < 1.0E-9 THEN
-        IK_OK := FALSE; ikTh3 := TarTheta3;
+        ok3 := FALSE; ikTh3 := TarTheta3;
     ELSE
         u1 := (-B + SQRT(Disc)) / denom;
         u2 := (-B - SQRT(Disc)) / denom;
@@ -244,16 +246,22 @@ ELSE
         ELSIF thetaSol2 > 0.0 THEN ikTh3 := thetaSol2;
         ELSE ikTh3 := thetaSol1;
         END_IF;
+        ok3 := TRUE;
     END_IF;
 END_IF;
 
+IK_OK := ok1 AND ok2 AND ok3;
+
 
 (* ============================================================================
-   【速度前馈】Δθ_ff = A⁻¹·B·v_plan · CycleTime
+   【速度前馈】θ̇ = -(∂f/∂P·v) / (∂f/∂θ) = -(B·v)/Aii
+   f = 约束方程 (肘-球距离 = l)，Aii = ∂f/∂θ，Bix/Biy/Biz = ∂f/∂x/∂y/∂z
+   注意负号：隐函数求导 θ̇ = -(∂f/∂P·v)/(∂f/∂θ)
+   各轴前馈仅在该轴 IK 求解成功时生效，失败轴严格保持目标角度
    ============================================================================ *)
 dTh1_ff := 0.0; dTh2_ff := 0.0; dTh3_ff := 0.0;
 
-IF FfEnable THEN
+IF FfEnable AND ok1 THEN
     xp := PlanX * COS1 + PlanY * SIN1;
     yp := -PlanX * SIN1 + PlanY * COS1;
     ct := COS(ikTh1); st := SIN(ikTh1);
@@ -262,9 +270,11 @@ IF FfEnable THEN
     Biy := -2.0 * ((L*ct + e - xp) * SIN1 - yp * COS1);
     Biz := -2.0 * (L * st - PlanZ);
     IF ABS(Aii) > 1.0E-9 THEN
-        dTh1_ff := ((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
+        dTh1_ff := -((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
     END_IF;
+END_IF;
 
+IF FfEnable AND ok2 THEN
     xp := PlanX * COS2 + PlanY * SIN2;
     yp := -PlanX * SIN2 + PlanY * COS2;
     ct := COS(ikTh2); st := SIN(ikTh2);
@@ -273,9 +283,11 @@ IF FfEnable THEN
     Biy := -2.0 * ((L*ct + e - xp) * SIN2 - yp * COS2);
     Biz := -2.0 * (L * st - PlanZ);
     IF ABS(Aii) > 1.0E-9 THEN
-        dTh2_ff := ((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
+        dTh2_ff := -((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
     END_IF;
+END_IF;
 
+IF FfEnable AND ok3 THEN
     xp := PlanX * COS3 + PlanY * SIN3;
     yp := -PlanX * SIN3 + PlanY * COS3;
     ct := COS(ikTh3); st := SIN(ikTh3);
@@ -284,7 +296,7 @@ IF FfEnable THEN
     Biy := -2.0 * ((L*ct + e - xp) * SIN3 - yp * COS3);
     Biz := -2.0 * (L * st - PlanZ);
     IF ABS(Aii) > 1.0E-9 THEN
-        dTh3_ff := ((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
+        dTh3_ff := -((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime;
     END_IF;
 END_IF;
 

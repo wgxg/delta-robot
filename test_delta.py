@@ -136,9 +136,10 @@ class FB_DeltaKinematics:
         if not ok2: ikTh2 = self.TarTheta2
         if not ok3: ikTh3 = self.TarTheta3
 
-        # 前馈
+        # 前馈: θ̇ = -(∂f/∂P·v)/(∂f/∂θ) = -(B·v)/Aii（隐函数求导带负号）
+        # 各轴前馈仅在该轴 IK 成功时生效，失败轴严格保持
         dTh1_ff = dTh2_ff = dTh3_ff = 0.0
-        if FfEnable:
+        if FfEnable and ok1:
             def ff_ax(cos_a, sin_a, ik_th):
                 xp = PlanX * cos_a + PlanY * sin_a
                 yp = -PlanX * sin_a + PlanY * cos_a
@@ -149,10 +150,12 @@ class FB_DeltaKinematics:
                 Biy = -2.0 * ((L*ct + e - xp) * sin_a - yp * cos_a)
                 Biz = -2.0 * (L * st - PlanZ)
                 if abs(Aii) > 1e-9:
-                    return ((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime
+                    return -((Bix*PlanVX + Biy*PlanVY + Biz*PlanVZ) / Aii) * CycleTime
                 return 0.0
             dTh1_ff = ff_ax(COS1, SIN1, ikTh1)
+        if FfEnable and ok2:
             dTh2_ff = ff_ax(COS2, SIN2, ikTh2)
+        if FfEnable and ok3:
             dTh3_ff = ff_ax(COS3, SIN3, ikTh3)
 
         self.TarTheta1 = ikTh1 + Kff * dTh1_ff
@@ -261,6 +264,7 @@ class FB_PTP:
                                        (TargetZ-self.curZ)**2)
             if self.totalDist < 1e-4:
                 self.PlanX = self.tgtX; self.PlanY = self.tgtY; self.PlanZ = self.tgtZ
+                self.PlanVX = self.PlanVY = self.PlanVZ = 0.0
                 self.s = 1.0; self.phase = 4; self.InPos = True; self.Busy = False
             else:
                 self.maxSVel = Speed / self.totalDist
@@ -337,7 +341,7 @@ class FB_PTP:
             self.PlanVZ = (self.tgtZ - self.curZ) * self.sVel
 
             if self.phase == 4:
-                self.PlanX = self.tgtX; self.PlanY = self.tgtY; self.PlanZ = self.tgtZ
+                # Plan 保持最终插值角度的 FK 结果，不强制写为目标值
                 self.PlanVX = self.PlanVY = self.PlanVZ = 0.0
                 self.InPos = True; self.Busy = False
 
@@ -592,6 +596,7 @@ class FB_CIR:
 
             if self.arcLen < 1e-4:
                 self.PlanX = ex; self.PlanY = ey; self.PlanZ = ez
+                self.PlanVX = self.PlanVY = self.PlanVZ = 0.0
                 self.s = 1.0; self.phase = 4; self.InPos = True; self.Busy = False
             else:
                 self.maxSVel = Speed / self.arcLen
@@ -707,7 +712,10 @@ class FB_DeltaCore:
 
         # 第二步：新指令
         if exRise:
-            if self.Busy:
+            if cmd.MoveType < 0 or cmd.MoveType > 2:
+                # 非法运动类型：拒绝，避免 Busy 卡死
+                self.Rejected = True
+            elif self.Busy:
                 if cmd.BufferMode == 0:
                     self.Rejected = True
                 elif cmd.BufferMode == 1:
@@ -1132,10 +1140,11 @@ if __name__ == '__main__':
     core = FB_DeltaCore()
     cmd0 = make_cmd(0, 0, 0, 250, speed=200, accel=1000)
     run_core(core, cmd0)
-    cmd = make_cmd(0, -80, 70, 400, speed=250, accel=1500, move_mode=1)
+    # 目标须在工作空间内（本机型 Z_max≈346mm），Z=400 不可达
+    cmd = make_cmd(0, -80, 70, 300, speed=250, accel=1500, move_mode=1)
     cycles, _, _, _ = run_core(core, cmd, max_cycles=8000)
     test("大行程完成", cycles > 0, f"cycles={cycles}")
-    test("到达目标", abs(core.PlanX+80)<2 and abs(core.PlanY-70)<2 and abs(core.PlanZ-400)<2,
+    test("到达目标", abs(core.PlanX+80)<2 and abs(core.PlanY-70)<2 and abs(core.PlanZ-300)<2,
          f"({core.PlanX:.1f},{core.PlanY:.1f},{core.PlanZ:.1f})")
 
 

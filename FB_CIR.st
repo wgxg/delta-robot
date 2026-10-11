@@ -213,6 +213,7 @@ IF exRise THEN
 
     IF arcLen < 1.0E-4 THEN
         PlanX:=ex; PlanY:=ey; PlanZ:=ez;
+        PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
         s:=1.0; phase:=4; InPos:=TRUE; Busy:=FALSE;
     ELSE
         (* 转换到进度域：v_s = v_cart / arcLen *)

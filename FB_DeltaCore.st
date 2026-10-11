@@ -109,7 +109,10 @@ END_IF;
 
 (* --- 第二步：处理新指令 --- *)
 IF exRise THEN
-    IF Busy THEN
+    IF (cmd.MoveType < 0) OR (cmd.MoveType > 2) THEN
+        (* 非法运动类型：拒绝，避免启动后无对应FB执行导致Busy卡死 *)
+        Rejected := TRUE;
+    ELSIF Busy THEN
         CASE cmd.BufferMode OF
             0:  (* 拒绝 *)
                 Rejected := TRUE;
