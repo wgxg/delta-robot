@@ -1,269 +1,104 @@
 (* ============================================================================
-   功能块名称 : FB_DeltaCore  （核心层，唯一入口）
-   功能描述 : Delta 机器人运动控制核心，一直周期调用
-              1. 运动学（FK+IK+前馈）始终运行，维护当前位置和目标角度
-              2. 应用层通过 cmd + Execute 下发运动指令
-              3. 每条指令自带 BufferMode 指定处理方式：
-                 0=拒绝：运动中来了新指令直接拒绝
-                 1=打断：立即停止当前，从当前规划位置执行新指令
-                 2=缓存：当前完成后自动执行缓存的指令（缓存槽满则拒绝）
-              4. 所有输出由本FB统一维护
-              5. 空闲（无指令执行）时输出跟随当前输入角度：
-                 TarTheta = CurTheta（1:1），Plan = FK(CurTheta)，PlanV = 0
-                 执行指令时：TarTheta = IK(Plan)+前馈，Plan = 运动规划输出
+   功能块名称 : FB_DeltaCore  （纯运动学引擎，一直周期调用）
+   功能描述 : Delta 机器人核心层，只做运动学，不做指令调度
+              1. 每周期把机械参数/使能写入共享 Axis，供指令FB读取（参数唯一来源）
+              2. 消费活跃指令FB写入的 Axis.Plan*，调用 FB_DeltaKinematics
+                 完成 IK/FK/速度前馈，输出目标角度 TarTheta
+              3. FK 始终运行，维护当前实际位置 CurX/Y/Z
+              4. 空闲（Axis.Busy=FALSE，无指令执行）时：
+                   Plan = CurX/Y/Z（跟随FK实际位置），PlanV = 0
+                   TarTheta = CurTheta（1:1 跟随当前输入角度）
+                 有指令执行时：
+                   TarTheta = IK(Plan) + 前馈
+   调用约定 : 每个扫描周期先调用所有指令FB（FB_PTP/FB_LIN/FB_CIR），
+              最后调用本FB。调度（Execute/BufferMode/Busy/InPos/打断/缓存）
+              全部由指令FB通过共享 Axis 自行协调，本FB不参与。
    ============================================================================ *)
 
 FUNCTION_BLOCK FB_DeltaCore
 
 VAR_INPUT
-    R, r, L, l   : REAL;    (* 机械参数                              *)
-    cmd          : st_MoveCmd;  (* 运动指令（含 BufferMode）            *)
-    Execute      : BOOL;     (* 启动指令（上升沿）                    *)
-    CurTheta1    : REAL;     (* 当前角度 1 (rad)                      *)
-    CurTheta2    : REAL;
-    CurTheta3    : REAL;
-    CycleTime    : REAL;     (* 周期 (s)                              *)
-    FfEnable     : BOOL;     (* 前馈使能                              *)
-    Kff          : REAL;     (* 前馈增益                              *)
-    Enable       : BOOL;     (* 使能                                  *)
+    R, r, L, l   : REAL;    (* 机械参数（写入Axis，全系统唯一来源）    *)
+    CycleTime    : REAL;    (* 周期 (s)                              *)
+    FfEnable     : BOOL;    (* 前馈使能                              *)
+    Kff          : REAL;    (* 前馈增益                              *)
+    Enable       : BOOL;    (* 使能                                  *)
 END_VAR
 
-VAR_OUTPUT
-    TarTheta1    : REAL;     (* 目标角度 1 (rad)                      *)
-    TarTheta2    : REAL;
-    TarTheta3    : REAL;
-    CurX         : REAL;     (* 当前位置 X (FK，始终更新)             *)
-    CurY         : REAL;
-    CurZ         : REAL;
-    PlanX        : REAL;     (* 规划位置 X                            *)
-    PlanY        : REAL;
-    PlanZ        : REAL;
-    InPos        : BOOL;     (* 指令完成                              *)
-    Busy         : BOOL;     (* 运动中                                *)
-    Rejected     : BOOL;     (* 指令被拒绝                            *)
-    Buffered     : BOOL;     (* 有缓存指令等待                        *)
-    ActiveType   : INT;      (* 当前运动类型 0=无 1=PTP 2=LIN 3=CIR  *)
+VAR_IN_OUT
+    Axis         : st_DeltaAxis;   (* 共享轴状态（与指令FB同一个实例） *)
 END_VAR
 
 VAR
-    fbPTP : FB_PTP;
-    fbLIN : FB_LIN;
-    fbCIR : FB_CIR;
     fbKin : FB_DeltaKinematics;
-
-    execPTP  : BOOL;
-    execLIN  : BOOL;
-    execCIR  : BOOL;
-    exLast   : BOOL;
-    exRise   : BOOL;
-    planVX, planVY, planVZ : REAL;
-
-    bufCmd   : st_MoveCmd;  (* 缓存指令                              *)
-    hasBuf   : BOOL;        (* 有缓存指令                            *)
-    bufActive: BOOL;        (* 正在执行缓存指令                      *)
-    pendingStart: BOOL;     (* 待启动缓存指令（跨周期）              *)
-    curType  : INT;         (* 当前运动类型(0/1/2)                   *)
-    startType: INT;         (* 本周期要启动的运动类型(-1=不启动)     *)
-    effCmd   : st_MoveCmd;  (* 当前生效的指令（cmd 或 bufCmd）       *)
 END_VAR
 
 
 (* ============================================================================
-   失能处理
+   失能：清零输出与调度状态，通知指令FB复位
    ============================================================================ *)
 IF NOT Enable THEN
-    TarTheta1:=0.0; TarTheta2:=0.0; TarTheta3:=0.0;
-    CurX:=0.0; CurY:=0.0; CurZ:=0.0;
-    PlanX:=0.0; PlanY:=0.0; PlanZ:=0.0;
-    InPos:=FALSE; Busy:=FALSE; Rejected:=FALSE; Buffered:=FALSE; ActiveType:=0;
-    execPTP:=FALSE; execLIN:=FALSE; execCIR:=FALSE;
-    hasBuf:=FALSE; bufActive:=FALSE; pendingStart:=FALSE; curType:=0; startType:=-1;
+    Axis.Enable := FALSE;
+    Axis.R:=R; Axis.r:=r; Axis.L:=L; Axis.l:=l;
+    Axis.TarTheta1:=0.0; Axis.TarTheta2:=0.0; Axis.TarTheta3:=0.0;
+    Axis.CurX:=0.0; Axis.CurY:=0.0; Axis.CurZ:=0.0;
+    Axis.PlanX:=0.0; Axis.PlanY:=0.0; Axis.PlanZ:=0.0;
+    Axis.PlanVX:=0.0; Axis.PlanVY:=0.0; Axis.PlanVZ:=0.0;
+    Axis.Busy:=FALSE; Axis.ActiveType:=0; Axis.owner:=0;
+    Axis.cmdCount:=0; Axis.hasBuf:=FALSE; Axis.InPos:=FALSE;
     RETURN;
 END_IF;
 
 
 (* ============================================================================
-   Execute 上升沿检测
+   1. 发布机械参数/使能到共享轴（指令FB下周期即可见）
    ============================================================================ *)
-exRise := Execute AND NOT exLast;
-exLast := Execute;
-
-Rejected := FALSE;
-startType := -1;   (* 默认本周期不启动新运动 *)
+Axis.R:=R; Axis.r:=r; Axis.L:=L; Axis.l:=l;
+Axis.CycleTime:=CycleTime;
+Axis.FfEnable:=FfEnable; Axis.Kff:=Kff;
+Axis.Enable:=TRUE;
 
 
 (* ============================================================================
-   指令处理（按 cmd.BufferMode）
-   ----------------------------------------------------------------------------
-   用 startType 统一协调：pendingStart（缓存自动启动）和 exRise（新指令）
-   都通过设置 startType 来触发运动 FB 的 Execute。
-   若两者同周期发生，exRise 的打断可覆盖 pendingStart。
+   2. 空闲跟随：无活跃指令时规划位置=FK实际位置，规划速度=0
+      （有活跃指令时 Plan* 已由该指令FB在本周期写好，保持不动）
    ============================================================================ *)
-
-(* --- 第一步：处理待启动的缓存指令 --- *)
-IF pendingStart THEN
-    startType := bufCmd.MoveType;
-    Busy := TRUE;
-    InPos := FALSE;
-    bufActive := TRUE;
-    hasBuf := FALSE;
-    pendingStart := FALSE;
-END_IF;
-
-(* --- 第二步：处理新指令 --- *)
-IF exRise THEN
-    IF (cmd.MoveType < 0) OR (cmd.MoveType > 2) THEN
-        (* 非法运动类型：拒绝，避免启动后无对应FB执行导致Busy卡死 *)
-        Rejected := TRUE;
-    ELSIF Busy THEN
-        CASE cmd.BufferMode OF
-            0:  (* 拒绝 *)
-                Rejected := TRUE;
-
-            1:  (* 打断：覆盖 startType，清掉缓存 *)
-                startType := cmd.MoveType;
-                InPos := FALSE;
-                hasBuf := FALSE;
-                bufActive := FALSE;
-
-            2:  (* 缓存 *)
-                IF hasBuf THEN
-                    Rejected := TRUE;   (* 缓存槽已满 *)
-                ELSE
-                    bufCmd := cmd;
-                    hasBuf := TRUE;
-                END_IF;
-        END_CASE;
-    ELSE
-        (* 空闲：直接启动 *)
-        startType := cmd.MoveType;
-        Busy := TRUE;
-        InPos := FALSE;
-    END_IF;
-END_IF;
-
-(* --- 第三步：根据 startType 设置运动 FB 的 Execute 信号 --- *)
-IF startType >= 0 THEN
-    curType := startType;
-    execPTP := (curType = 0);
-    execLIN := (curType = 1);
-    execCIR := (curType = 2);
-    ActiveType := curType + 1;
-ELSE
-    execPTP := FALSE; execLIN := FALSE; execCIR := FALSE;
-END_IF;
-
-Buffered := hasBuf;
-
-(* 选择当前生效的指令：正在执行缓存指令时用 bufCmd，否则用 cmd *)
-IF bufActive THEN
-    effCmd := bufCmd;
-ELSE
-    effCmd := cmd;
+IF NOT Axis.Busy THEN
+    Axis.PlanX := Axis.CurX;
+    Axis.PlanY := Axis.CurY;
+    Axis.PlanZ := Axis.CurZ;
+    Axis.PlanVX := 0.0;
+    Axis.PlanVY := 0.0;
+    Axis.PlanVZ := 0.0;
 END_IF;
 
 
 (* ============================================================================
-   调用运动规划FB
-   ============================================================================ *)
-fbPTP(
-    R:=R, r:=r, L:=L, l:=l,
-    TargetX:=effCmd.PosX, TargetY:=effCmd.PosY, TargetZ:=effCmd.PosZ,
-    CurTheta1:=CurTheta1, CurTheta2:=CurTheta2, CurTheta3:=CurTheta3,
-    Speed:=effCmd.Speed, Accel:=effCmd.Accel, Jerk:=effCmd.Jerk,
-    MoveMode:=effCmd.MoveMode, CycleTime:=CycleTime,
-    Enable:=Enable, Execute:=execPTP
-);
-
-fbLIN(
-    TargetX:=effCmd.PosX, TargetY:=effCmd.PosY, TargetZ:=effCmd.PosZ,
-    Speed:=effCmd.Speed, Accel:=effCmd.Accel, Jerk:=effCmd.Jerk,
-    MoveMode:=effCmd.MoveMode, CycleTime:=CycleTime,
-    Enable:=Enable, Execute:=execLIN,
-    InitX:=CurX, InitY:=CurY, InitZ:=CurZ
-);
-
-fbCIR(
-    TargetX:=effCmd.PosX, TargetY:=effCmd.PosY, TargetZ:=effCmd.PosZ,
-    AuxX:=effCmd.AuxX, AuxY:=effCmd.AuxY, AuxZ:=effCmd.AuxZ,
-    CirMode:=effCmd.CirMode,
-    Speed:=effCmd.Speed, Accel:=effCmd.Accel, Jerk:=effCmd.Jerk,
-    MoveMode:=effCmd.MoveMode, CycleTime:=CycleTime,
-    Enable:=Enable, Execute:=execCIR,
-    InitX:=CurX, InitY:=CurY, InitZ:=CurZ
-);
-
-
-(* ============================================================================
-   选择当前运动FB的规划位置和速度
-   空闲时输出跟随当前输入角度（Plan = FK 位置，速度 = 0）
-   ============================================================================ *)
-IF Busy THEN
-    CASE curType OF
-        0:
-            PlanX := fbPTP.PlanX; PlanY := fbPTP.PlanY; PlanZ := fbPTP.PlanZ;
-            planVX := fbPTP.PlanVX; planVY := fbPTP.PlanVY; planVZ := fbPTP.PlanVZ;
-        1:
-            PlanX := fbLIN.PlanX; PlanY := fbLIN.PlanY; PlanZ := fbLIN.PlanZ;
-            planVX := fbLIN.PlanVX; planVY := fbLIN.PlanVY; planVZ := fbLIN.PlanVZ;
-        2:
-            PlanX := fbCIR.PlanX; PlanY := fbCIR.PlanY; PlanZ := fbCIR.PlanZ;
-            planVX := fbCIR.PlanVX; planVY := fbCIR.PlanVY; planVZ := fbCIR.PlanVZ;
-    END_CASE;
-ELSE
-    PlanX := CurX; PlanY := CurY; PlanZ := CurZ;
-    planVX := 0.0; planVY := 0.0; planVZ := 0.0;
-END_IF;
-
-
-(* ============================================================================
-   调用基础运动学（始终运行）
+   3. 基础运动学（始终运行）：IK(Plan)+前馈 / FK(CurTheta)
    ============================================================================ *)
 fbKin(
     R:=R, r:=r, L:=L, l:=l,
-    PlanX:=PlanX, PlanY:=PlanY, PlanZ:=PlanZ,
-    PlanVX:=planVX, PlanVY:=planVY, PlanVZ:=planVZ,
+    PlanX:=Axis.PlanX, PlanY:=Axis.PlanY, PlanZ:=Axis.PlanZ,
+    PlanVX:=Axis.PlanVX, PlanVY:=Axis.PlanVY, PlanVZ:=Axis.PlanVZ,
     FfEnable:=FfEnable, Kff:=Kff,
-    CurTheta1:=CurTheta1, CurTheta2:=CurTheta2, CurTheta3:=CurTheta3,
+    CurTheta1:=Axis.CurTheta1, CurTheta2:=Axis.CurTheta2, CurTheta3:=Axis.CurTheta3,
     CycleTime:=CycleTime, Enable:=Enable
 );
 
-IF Busy THEN
-    (* 执行指令：输出指令计算的目标角度 *)
-    TarTheta1 := fbKin.TarTheta1;
-    TarTheta2 := fbKin.TarTheta2;
-    TarTheta3 := fbKin.TarTheta3;
+(* FK 实际位置始终更新 *)
+Axis.CurX := fbKin.CurX;
+Axis.CurY := fbKin.CurY;
+Axis.CurZ := fbKin.CurZ;
+
+(* 执行指令：目标角度=IK(Plan)+前馈；空闲：目标角度=当前角度（1:1跟随） *)
+IF Axis.Busy THEN
+    Axis.TarTheta1 := fbKin.TarTheta1;
+    Axis.TarTheta2 := fbKin.TarTheta2;
+    Axis.TarTheta3 := fbKin.TarTheta3;
 ELSE
-    (* 空闲：目标角度 = 当前输入角度（跟随实际位置） *)
-    TarTheta1 := CurTheta1;
-    TarTheta2 := CurTheta2;
-    TarTheta3 := CurTheta3;
-END_IF;
-CurX := fbKin.CurX;
-CurY := fbKin.CurY;
-CurZ := fbKin.CurZ;
-
-
-(* ============================================================================
-   运动完成检测 + 缓存指令待启动
-   ============================================================================ *)
-IF Busy THEN
-    CASE curType OF
-        0:  IF fbPTP.InPos THEN InPos := TRUE; END_IF;
-        1:  IF fbLIN.InPos THEN InPos := TRUE; END_IF;
-        2:  IF fbCIR.InPos THEN InPos := TRUE; END_IF;
-    END_CASE;
-
-    IF InPos THEN
-        Busy := FALSE;
-        ActiveType := 0;
-        bufActive := FALSE;
-
-        (* 有缓存指令则标记待启动，下一周期生效 *)
-        IF hasBuf THEN
-            pendingStart := TRUE;
-        END_IF;
-    END_IF;
+    Axis.TarTheta1 := Axis.CurTheta1;
+    Axis.TarTheta2 := Axis.CurTheta2;
+    Axis.TarTheta3 := Axis.CurTheta3;
 END_IF;
 
 END_FUNCTION_BLOCK

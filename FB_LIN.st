@@ -1,35 +1,37 @@
 (* ============================================================================
    功能块名称 : FB_LIN
-   功能描述 : Delta 机器人笛卡尔空间直线插补
+   功能描述 : Delta 机器人笛卡尔空间直线插补指令 FB（PLCopen 风格）
               Plan = Start + dir × (s × totalDist)
               s 按加减速曲线（梯形/S曲线）从 0 走到 1
-              起点为上一次的规划位置（首次使用需外部初始化）
-   调用方式 : 周期调用，Execute 上升沿启动
+              起点取共享轴 Axis.CurX/Y/Z（核心层FK实际位置），保证连续
+   调用方式 : 每周期先调用各指令FB，最后调用 FB_DeltaCore
+              Execute 上升沿启动；多指令FB共享同一 Axis(VAR_IN_OUT) 协调
+   BufferMode: 0=拒绝 1=打断 2=缓存
    ============================================================================ *)
 
 FUNCTION_BLOCK FB_LIN
 
 VAR_INPUT
-    TargetX      : REAL;    (* 目标位置 X (mm)                       *)
-    TargetY      : REAL;
-    TargetZ      : REAL;
-    Speed        : REAL;    (* 最大速度 (mm/s)                        *)
-    Accel        : REAL;    (* 最大加速度 (mm/s²)                     *)
-    Jerk         : REAL;    (* 最大加加速度 (mm/s³)，S曲线用          *)
-    MoveMode     : INT;     (* 0=梯形 1=S曲线                         *)
-    CycleTime    : REAL;    (* 周期 (s)                               *)
-    Enable       : BOOL;
-    Execute      : BOOL;    (* 启动脉冲                               *)
-    InitX        : REAL;    (* 初始位置 X（首次启用时用）             *)
-    InitY        : REAL;
-    InitZ        : REAL;
+    Execute      : BOOL;    (* 启动（上升沿有效）                       *)
+    PositionX    : REAL;    (* 目标位置 X (mm)                          *)
+    PositionY    : REAL;
+    PositionZ    : REAL;
+    Speed        : REAL;    (* 最大速度 (mm/s)                          *)
+    Accel        : REAL;    (* 最大加速度 (mm/s²)                       *)
+    Jerk         : REAL;    (* 最大加加速度 (mm/s³)，S曲线用            *)
+    MoveMode     : INT;     (* 0=梯形 1=S曲线                           *)
+    BufferMode   : INT;     (* 0=拒绝 1=打断 2=缓存                     *)
+END_VAR
+
+VAR_IN_OUT
+    Axis         : st_DeltaAxis;   (* 共享轴状态                        *)
 END_VAR
 
 VAR_OUTPUT
-    PlanX, PlanY, PlanZ : REAL;    (* 规划位置 (mm)                *)
-    PlanVX, PlanVY, PlanVZ : REAL; (* 规划速度 (mm/s)             *)
-    InPos        : BOOL;    (* 已到达                                *)
-    Busy         : BOOL;    (* 运动中                                *)
+    Busy            : BOOL;
+    InPos           : BOOL;
+    CommandAborted  : BOOL;
+    Rejected        : BOOL;
 END_VAR
 
 VAR
@@ -46,69 +48,108 @@ VAR
     sStop:REAL;                 (* 减速距离（进度域） *)
     sRem:REAL;                  (* 剩余距离（进度域） *)
     phase:INT;                  (* 0=idle 1=accel 2=const 3=decel 4=done *)
+
+    (* 调度状态 *)
+    myId:DINT;
+    running:BOOL;
+    waiting:BOOL;
+    wantStart:BOOL;
     exLast:BOOL;
     exRise:BOOL;
-    enLast:BOOL;
 END_VAR
 
 
-IF NOT Enable THEN
-    PlanX:=0.0; PlanY:=0.0; PlanZ:=0.0;
-    PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
-    InPos:=FALSE; Busy:=FALSE; phase:=0; s:=0.0;
+(* 失能：复位自身，不写 Axis 规划 *)
+IF NOT Axis.Enable THEN
+    Busy:=FALSE; InPos:=FALSE; CommandAborted:=FALSE; Rejected:=FALSE;
+    running:=FALSE; waiting:=FALSE; phase:=0; s:=0.0;
+    exLast:=Execute;
     RETURN;
 END_IF;
 
-(* 首次启用：用 InitX/Y/Z 初始化规划位置（仅用于显示，不影响起点判断） *)
-IF NOT enLast THEN
-    PlanX := InitX; PlanY := InitY; PlanZ := InitZ;
-END_IF;
-enLast := Enable;
-
-(* Execute 上升沿 *)
+Rejected:=FALSE;
 exRise := Execute AND NOT exLast;
 exLast := Execute;
+wantStart := FALSE;
 
 
-(* ============================================================================
-   启动：记录起点，计算方向和总距离
-   ============================================================================ *)
+(* 第一步：上升沿仲裁 *)
 IF exRise THEN
-    (* 始终以 Init（核心层提供的FK实际位置）为起点，保证与实际位置连续 *)
-    startX := InitX; startY := InitY; startZ := InitZ;
-    dirX := TargetX - startX;
-    dirY := TargetY - startY;
-    dirZ := TargetZ - startZ;
-    tgtX := TargetX; tgtY := TargetY; tgtZ := TargetZ;
+    InPos:=FALSE; CommandAborted:=FALSE; waiting:=FALSE;
+
+    IF (Speed <= 0.0) OR (Accel <= 0.0) OR ((MoveMode = 1) AND (Jerk <= 0.0)) THEN
+        Rejected:=TRUE;
+    ELSIF running AND (Axis.owner = myId) THEN
+        wantStart:=TRUE;
+    ELSIF Axis.Busy THEN
+        CASE BufferMode OF
+            0: Rejected:=TRUE;
+            1: wantStart:=TRUE;
+            2:
+                IF Axis.hasBuf THEN
+                    Rejected:=TRUE;
+                ELSE
+                    waiting:=TRUE; Axis.hasBuf:=TRUE; Busy:=TRUE;
+                END_IF;
+        END_CASE;
+    ELSE
+        wantStart:=TRUE;
+    END_IF;
+END_IF;
+
+(* 第二步：缓存等待处理 *)
+IF waiting THEN
+    IF NOT Axis.hasBuf THEN
+        waiting:=FALSE; Busy:=FALSE; CommandAborted:=TRUE;
+    ELSIF NOT Axis.Busy THEN
+        waiting:=FALSE; Axis.hasBuf:=FALSE; wantStart:=TRUE;
+    END_IF;
+END_IF;
+
+(* 第三步：统一启动（令牌 + 几何初始化） *)
+IF wantStart THEN
+    myId:=Axis.cmdCount + 1;
+    Axis.cmdCount:=myId;
+    Axis.owner:=myId;
+    Axis.ActiveType:=2;
+    Axis.Busy:=TRUE;
+    Axis.InPos:=FALSE;
+    Axis.hasBuf:=FALSE;
+    running:=TRUE; Busy:=TRUE; InPos:=FALSE;
+
+    (* 以核心层 FK 实际位置为起点，保证与实际位置连续 *)
+    startX := Axis.CurX; startY := Axis.CurY; startZ := Axis.CurZ;
+    dirX := PositionX - startX;
+    dirY := PositionY - startY;
+    dirZ := PositionZ - startZ;
+    tgtX := PositionX; tgtY := PositionY; tgtZ := PositionZ;
     totalDist := SQRT(dirX*dirX + dirY*dirY + dirZ*dirZ);
 
     IF totalDist < 1.0E-4 THEN
-        (* 已在目标位置 *)
-        PlanX:=tgtX; PlanY:=tgtY; PlanZ:=tgtZ;
-        PlanVX:=0.0; PlanVY:=0.0; PlanVZ:=0.0;
-        s:=1.0; phase:=4; InPos:=TRUE; Busy:=FALSE;
+        Axis.PlanX:=tgtX; Axis.PlanY:=tgtY; Axis.PlanZ:=tgtZ;
+        Axis.PlanVX:=0.0; Axis.PlanVY:=0.0; Axis.PlanVZ:=0.0;
+        s:=1.0; phase:=4;
     ELSE
         dirX := dirX / totalDist;
         dirY := dirY / totalDist;
         dirZ := dirZ / totalDist;
-        (* 转换到进度域：v_s = v_cart / totalDist *)
         maxSVel := Speed / totalDist;
         maxSAcc  := Accel / totalDist;
         maxSJerk := Jerk / totalDist;
         s:=0.0; sVel:=0.0; sAcc:=0.0; phase:=1;
-        InPos:=FALSE; Busy:=TRUE;
     END_IF;
 END_IF;
 
+(* 第四步：被其他指令打断 *)
+IF running AND (Axis.owner <> myId) THEN
+    running:=FALSE; phase:=0; Busy:=FALSE; CommandAborted:=TRUE;
+END_IF;
 
-(* ============================================================================
-   每周期：加减速 + 直线插补
-   ============================================================================ *)
-IF phase <> 4 AND phase <> 0 THEN
+(* 第五步：加减速 + 直线插补 → 写 Axis.Plan* *)
+IF running AND (phase = 1 OR phase = 2 OR phase = 3) THEN
 
     sRem := 1.0 - s;
 
-    (* 减速距离估计（进度域） *)
     IF MoveMode = 0 THEN
         sStop := sVel * sVel / (2.0 * maxSAcc);
     ELSE
@@ -123,10 +164,10 @@ IF phase <> 4 AND phase <> 0 THEN
                 IF MoveMode = 0 THEN
                     sAcc := maxSAcc;
                 ELSE
-                    sAcc := sAcc + maxSJerk * CycleTime;
+                    sAcc := sAcc + maxSJerk * Axis.CycleTime;
                     IF sAcc > maxSAcc THEN sAcc := maxSAcc; END_IF;
                 END_IF;
-                sVel := sVel + sAcc * CycleTime;
+                sVel := sVel + sAcc * Axis.CycleTime;
                 IF sVel >= maxSVel THEN
                     sVel := maxSVel; sAcc := 0.0; phase := 2;
                 END_IF;
@@ -143,10 +184,10 @@ IF phase <> 4 AND phase <> 0 THEN
             IF MoveMode = 0 THEN
                 sAcc := -maxSAcc;
             ELSE
-                sAcc := sAcc - maxSJerk * CycleTime;
+                sAcc := sAcc - maxSJerk * Axis.CycleTime;
                 IF sAcc < -maxSAcc THEN sAcc := -maxSAcc; END_IF;
             END_IF;
-            sVel := sVel + sAcc * CycleTime;
+            sVel := sVel + sAcc * Axis.CycleTime;
             IF sVel <= 0.0 THEN
                 sVel := 0.0; sAcc := 0.0;
                 s := 1.0; phase := 4;
@@ -154,25 +195,31 @@ IF phase <> 4 AND phase <> 0 THEN
     END_CASE;
 
     IF phase <> 4 THEN
-        s := s + sVel * CycleTime;
+        s := s + sVel * Axis.CycleTime;
         IF s > 1.0 THEN s := 1.0; END_IF;
     END_IF;
 
     (* 直线插补：Plan = Start + dir × (s × totalDist) *)
-    PlanX := startX + dirX * s * totalDist;
-    PlanY := startY + dirY * s * totalDist;
-    PlanZ := startZ + dirZ * s * totalDist;
+    Axis.PlanX := startX + dirX * s * totalDist;
+    Axis.PlanY := startY + dirY * s * totalDist;
+    Axis.PlanZ := startZ + dirZ * s * totalDist;
 
-    (* 规划速度 = dir × sVel × totalDist（进度速度转笛卡尔速度） *)
-    PlanVX := dirX * sVel * totalDist;
-    PlanVY := dirY * sVel * totalDist;
-    PlanVZ := dirZ * sVel * totalDist;
+    (* 规划速度 = dir × sVel × totalDist *)
+    Axis.PlanVX := dirX * sVel * totalDist;
+    Axis.PlanVY := dirY * sVel * totalDist;
+    Axis.PlanVZ := dirZ * sVel * totalDist;
 
     IF phase = 4 THEN
-        PlanX := tgtX; PlanY := tgtY; PlanZ := tgtZ;
-        PlanVX := 0.0; PlanVY := 0.0; PlanVZ := 0.0;
-        InPos := TRUE; Busy := FALSE;
+        Axis.PlanX := tgtX; Axis.PlanY := tgtY; Axis.PlanZ := tgtZ;
+        Axis.PlanVX := 0.0; Axis.PlanVY := 0.0; Axis.PlanVZ := 0.0;
     END_IF;
+END_IF;
+
+(* 第六步：完成 → 释放轴控制权 *)
+IF running AND (phase = 4) THEN
+    running:=FALSE;
+    Busy:=FALSE; InPos:=TRUE;
+    Axis.Busy:=FALSE; Axis.ActiveType:=0; Axis.owner:=0; Axis.InPos:=TRUE;
 END_IF;
 
 END_FUNCTION_BLOCK
