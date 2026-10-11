@@ -324,6 +324,102 @@ def fk(angles, guess=DEFAULT_GUESS, P=None, tol=1e-8, max_iter=60):
     return None
 
 
+# ---------------------------------------------------------------- FK（LM 跟踪版）
+def fk_track(angles, guess, P=None, tol=1e-8, max_iter=40, lam0=1e-3):
+    """控制环路温启动 FK：列归一化 + Levenberg-Marquardt 阻尼 + 残差单调线搜索。
+
+    为什么不能直接用纯牛顿 fk()：六链 Delta 的 FK 有多组装配解（同一组电机角
+    对应多个平台位姿，实测纯牛顿在倾斜路径上 60/510 周期滑入另一装配根，姿态偏
+    20°+）。纯牛顿只保证收敛、不保证装配连续。控制环路每 1ms 一拍，上一拍位姿
+    距真根极近（<0.1°），而另一装配根在 20° 外、中间隔着高残差壁垒；LM 每步
+    只接受残差严格下降的步，数学上无法越过壁垒，故装配连续性可保证。
+    近根处 λ→0，退化为二次收敛的牛顿步。
+
+    返回 (pose6, iters, maxerr)；不收敛返回 None。
+    冷启动（guess 不近真根）仍应先调纯牛顿 fk() 建立首拍位姿。"""
+    P = P or PARAMS
+    R, r = P['R'], P['r']
+    L, l = P['L'], P['l']
+    Rac, ra = P['Rac'], P['ra']
+    La, lb = P['La'], P['lb']
+    elbows = [None] * 6
+    chain_loc = [None] * 6
+    for k in range(3):
+        cph = math.cos(PHI[k])
+        sph = math.sin(PHI[k])
+        th = angles[k]
+        ce, se = math.cos(th), math.sin(th)
+        er = R + L * ce
+        elbows[k] = (er * cph, er * sph, L * se)
+        chain_loc[k] = (r * cph, r * sph, L, l)
+        ph = angles[3 + k]
+        ce, se = math.cos(ph), math.sin(ph)
+        er = Rac + La * ce
+        elbows[3 + k] = (er * cph, er * sph, La * se)
+        chain_loc[3 + k] = (ra * cph, ra * sph, La, lb)
+
+    def residuals(xv):
+        px, py, pz, a4, b4, c4 = xv
+        Jm = [None] * 6
+        fv = [0.0] * 6
+        mx = 0.0
+        for k in range(6):
+            lax, lay, arm, rod = chain_loc[k]
+            Ra, dA, dB, dC = rot_partials(lax, lay, 0.0, a4, b4, c4)
+            dx = px + Ra[0] - elbows[k][0]
+            dy = py + Ra[1] - elbows[k][1]
+            dz = pz + Ra[2] - elbows[k][2]
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            mx = max(mx, abs(dist - rod))
+            fv[k] = dx * dx + dy * dy + dz * dz - rod * rod
+            Jm[k] = [2.0 * dx, 2.0 * dy, 2.0 * dz,
+                     2.0 * (dx * dA[0] + dy * dA[1] + dz * dA[2]),
+                     2.0 * (dx * dB[0] + dy * dB[1] + dz * dB[2]),
+                     2.0 * (dx * dC[0] + dy * dC[1] + dz * dC[2])]
+        return Jm, fv, mx
+
+    x = list(guess[:6])
+    lam = lam0
+    for it in range(1, max_iter + 1):
+        J, fvec, maxerr = residuals(x)
+        if maxerr < tol:
+            return (tuple(x), it - 1, maxerr)
+        cn = [0.0] * 6
+        for c2 in range(6):
+            s = 0.0
+            for rr in range(6):
+                v = J[rr][c2]
+                s += v * v
+            cn[c2] = math.sqrt(s)
+        cn = [c if c > 1e-14 else 1.0 for c in cn]
+        Jn = [[J[rr][c2] / cn[c2] for c2 in range(6)] for rr in range(6)]
+        JtJ = [[sum(Jn[rr][c] * Jn[rr][c2] for rr in range(6))
+                for c2 in range(6)] for c in range(6)]
+        Jtf = [sum(Jn[rr][c] * fvec[rr] for rr in range(6)) for c in range(6)]
+        err0 = sum(v * v for v in fvec)
+        accepted = False
+        for _ in range(12):
+            M = [[JtJ[c][c2] + (lam if c == c2 else 0.0) for c2 in range(6)]
+                 for c in range(6)]
+            sn, _ = _solve6(M, Jtf)
+            if sn is None:
+                lam *= 5.0
+                continue
+            xn = [x[c] - sn[c] / cn[c] for c in range(6)]
+            _, f1, _ = residuals(xn)
+            if sum(v * v for v in f1) < err0:
+                x = xn
+                lam = max(lam / 3.0, 1e-9)
+                accepted = True
+                break
+            lam *= 4.0
+        if not accepted:
+            return None
+        if maxerr > 1e9:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------- 前馈（解析关节速度）
 def ik_vel(pose, angles, twist, P=None):
     """位姿+电机角+位姿速度 → 关节速度（解析）。
