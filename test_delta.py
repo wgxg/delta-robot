@@ -211,21 +211,34 @@ class _CommandFB:
         wantStart = False
 
         if exRise:
+            # 若本实例正在缓存槽等待：旧待执行指令作废并释放槽位，再按新指令仲裁；
+            # 新指令被拒绝/槽满时，旧指令以 CommandAborted 留痕
+            was_waiting = self.waiting
+            if was_waiting:
+                axis.hasBuf = False
+                self.waiting = False
+                self.Busy = False
+
             self.InPos = False
             self.CommandAborted = False
-            self.waiting = False
             if Speed <= 0 or Accel <= 0 or (MoveMode == 1 and Jerk <= 0):
                 self.Rejected = True
+                if was_waiting:
+                    self.CommandAborted = True
             elif self.running and axis.owner == self.myId:
                 wantStart = True                      # 同实例重触发
             elif axis.Busy:
                 if BufferMode == 0:
                     self.Rejected = True
+                    if was_waiting:
+                        self.CommandAborted = True
                 elif BufferMode == 1:
                     wantStart = True                  # 打断
                 elif BufferMode == 2:
                     if axis.hasBuf:
                         self.Rejected = True          # 缓存槽满
+                        if was_waiting:
+                            self.CommandAborted = True
                     else:
                         self.waiting = True
                         axis.hasBuf = True

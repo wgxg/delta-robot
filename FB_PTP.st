@@ -72,6 +72,7 @@ VAR
     running:BOOL;               (* 本指令正在执行 *)
     waiting:BOOL;               (* 本指令在缓存槽等待 *)
     wantStart:BOOL;             (* 本周期请求启动（统一入口） *)
+    wasWaiting:BOOL;            (* 上升沿前本实例是否在缓存槽等待 *)
     exLast:BOOL;
     exRise:BOOL;
 END_VAR
@@ -99,11 +100,20 @@ wantStart := FALSE;
    第一步：上升沿仲裁
    ============================================================================ *)
 IF exRise THEN
-    InPos:=FALSE; CommandAborted:=FALSE; waiting:=FALSE;
+    (* 若本实例正在缓存槽等待：旧待执行指令作废并释放槽位，再按新指令仲裁；
+       新指令被拒绝/槽满时，旧指令以 CommandAborted 留痕 *)
+    wasWaiting := waiting;
+    IF waiting THEN
+        Axis.hasBuf:=FALSE;
+        waiting:=FALSE; Busy:=FALSE;
+    END_IF;
+
+    InPos:=FALSE; CommandAborted:=FALSE;
 
     IF (Speed <= 0.0) OR (Accel <= 0.0) OR ((MoveMode = 1) AND (Jerk <= 0.0)) THEN
         (* 参数非法：拒绝，避免除零或卡死 *)
         Rejected:=TRUE;
+        IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
     ELSIF running AND (Axis.owner = myId) THEN
         (* 同实例重触发（打断自己）：无条件从当前位置重启 *)
         wantStart:=TRUE;
@@ -111,11 +121,13 @@ IF exRise THEN
         CASE BufferMode OF
             0:  (* 拒绝 *)
                 Rejected:=TRUE;
+                IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
             1:  (* 打断：抢占当前指令 *)
                 wantStart:=TRUE;
             2:  (* 缓存：单槽，槽满则拒绝 *)
                 IF Axis.hasBuf THEN
                     Rejected:=TRUE;
+                    IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
                 ELSE
                     waiting:=TRUE; Axis.hasBuf:=TRUE; Busy:=TRUE;
                 END_IF;

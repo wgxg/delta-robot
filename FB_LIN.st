@@ -54,6 +54,7 @@ VAR
     running:BOOL;
     waiting:BOOL;
     wantStart:BOOL;
+    wasWaiting:BOOL;        (* 上升沿前本实例是否在缓存槽等待 *)
     exLast:BOOL;
     exRise:BOOL;
 END_VAR
@@ -75,19 +76,32 @@ wantStart := FALSE;
 
 (* 第一步：上升沿仲裁 *)
 IF exRise THEN
-    InPos:=FALSE; CommandAborted:=FALSE; waiting:=FALSE;
+    (* 若本实例正在缓存槽等待：旧待执行指令作废并释放槽位，再按新指令仲裁；
+       新指令被拒绝/槽满时，旧指令以 CommandAborted 留痕 *)
+    wasWaiting := waiting;
+    IF waiting THEN
+        Axis.hasBuf:=FALSE;
+        waiting:=FALSE; Busy:=FALSE;
+    END_IF;
+
+    InPos:=FALSE; CommandAborted:=FALSE;
 
     IF (Speed <= 0.0) OR (Accel <= 0.0) OR ((MoveMode = 1) AND (Jerk <= 0.0)) THEN
         Rejected:=TRUE;
+        IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
     ELSIF running AND (Axis.owner = myId) THEN
         wantStart:=TRUE;
     ELSIF Axis.Busy THEN
         CASE BufferMode OF
-            0: Rejected:=TRUE;
-            1: wantStart:=TRUE;
+            0:
+                Rejected:=TRUE;
+                IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
+            1:
+                wantStart:=TRUE;
             2:
                 IF Axis.hasBuf THEN
                     Rejected:=TRUE;
+                    IF wasWaiting THEN CommandAborted:=TRUE; END_IF;
                 ELSE
                     waiting:=TRUE; Axis.hasBuf:=TRUE; Busy:=TRUE;
                 END_IF;
